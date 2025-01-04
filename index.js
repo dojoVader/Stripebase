@@ -1,13 +1,20 @@
-// This example uses Express to receive webhooks
+// The following code is an example of a webhook endpoint that listens for Stripe events.
 const express = require('express');
 const app = express();
 const dotenv = require('dotenv')
 const firebaseAdmin = require("firebase-admin");
 
-const serviceAccount = require("./firebase_configuration_goes_here.json");
+const serviceAccount = require("./firebase-admin.json");
 const {getFirestore} = require("firebase-admin/firestore");
 const {getAuth} = require("firebase-admin/auth");
 dotenv.config();
+
+// SUBSCRIPTION CONSTANT
+
+const Subscription = {
+    BASIC: 'basic',
+    PREMIUM: 'premium'
+}
 
 const firebaseApp = firebaseAdmin.initializeApp({
     credential: firebaseAdmin.credential.cert(serviceAccount)
@@ -17,30 +24,59 @@ const auth = getAuth(firebaseApp);
 const fireStore = getFirestore(app);
 
 
-const createAuthUser = async (customerSession) => {
-    try {
-        await auth.createUser({
-            email: customerSession.email,
-            emailVerified: false,
-            password: 'password',
-            displayName: customerSession.name ? customerSession.name : "",
-        })
+const createCustomer = async (customerSession) => {
+    const user = await auth.getUserByEmail(customerSession.customer_details.email);
 
-    } catch (e) {
-        const user = await auth.getUserByEmail(customerSession.email);
+    // Set the name
+
+    if(customerSession.customer_details.name ){
         await auth.updateUser(user.uid, {
-            emailVerified: true,
-            displayName: customerSession.name ? customerSession.name : "",
-
-        })
+            displayName: customerSession.customer_details.name
+        });
     }
+    const customerRef = fireStore
+        .collection('customers')
+        .doc(user.uid)
 
-
+    const doc = await customerRef.get();
+    if (!doc.exists) {
+        // exists in Firebase Authentication
+        try {
+            await customerRef.create({
+                id: user.uid,
+                stripeId: customerSession.id,
+                email: user.email,
+                name: customerSession.customer_details.name,
+                phone: customerSession.customer_details.phone ? customerSession.customer_details.phone : "",
+                metadata: {
+                    ...customerSession.metadata,
+                    'firebaseRole': customerSession.payment_status === 'paid' ? Subscription.PREMIUM : Subscription.BASIC
+                }
+            });
+        } catch (e) {
+            console.error(e);
+        }
+        finally {
+            await fireStore
+                .collection('customers')
+                .doc(user.uid)
+                .collection("checkout_sessions")
+                .add({
+                    mode: "payment",
+                    price: customerSession.amount_total,
+                    success_url: customerSession.success_url,
+                    cancel_url: customerSession.cancel_url,
+                    status: customerSession.payment_status === 'paid' ? Subscription.PREMIUM : Subscription.BASIC,
+                });
+        }
+    }
 }
+
+
 
 // Match the raw body to content type application/json
 // If you are using Express v4 - v4.16 you need to use body-parser, not express, to retrieve the request body
-app.post('/', express.json({type: 'application/json'}), async (request, response) => {
+app.post('/webhook', express.json({type: 'application/json'}), async (request, response) => {
         const event = request.body;
 
         console.log(event)
@@ -51,6 +87,9 @@ app.post('/', express.json({type: 'application/json'}), async (request, response
             case 'customer.updated':
             case 'customer.created':
                 const customerSession = event.data.object;
+                if(customerSession.email === null){
+                    throw new Error('Stripe Email is required to create a user');
+                }
 
                 const user = await auth.getUserByEmail(customerSession.email);
                 const customerRef = fireStore
@@ -93,8 +132,9 @@ app.post('/', express.json({type: 'application/json'}), async (request, response
                         try {
                             const user = await auth.getUserByEmail(checkOutSession.customer_details.email);
                             await auth.setCustomUserClaims(user.uid, {
-                                firebaseRole: 'premium'
+                                firebaseRole: Subscription.PREMIUM
                             })
+                            await createCustomer(checkOutSession);
                         } catch (e) {
                             console.error(e);
                         }
@@ -107,56 +147,13 @@ app.post('/', express.json({type: 'application/json'}), async (request, response
                             await auth.setCustomUserClaims(user.uid, {
                                 firebaseRole: 'basic'
                             });
+                            await createCustomer(checkOutSession);
                         } catch (e) {
                             console.error(e);
                         }
 
                         break;
                 }
-
-
-                // Update the checkout session with the document id
-                if (checkOutSession.customer) {
-                    const tempuser = await auth.getUserByEmail(checkOutSession.customer_details.email);
-                    const refStore = await fireStore.collection('customers')
-                        .doc(tempuser.uid);
-                    const doc = await refStore.get();
-                    if (!doc.exists) {
-                        const user = await auth.getUserByEmail(checkOutSession.customer_details.email);
-                        await refStore.create({
-                            id: user.uid,
-                            stripeId: checkOutSession.customer,
-                            email: checkOutSession.customer_details.email,
-                            name: "",
-                            metadata: {
-                                ...checkOutSession.metadata,
-                                'firebaseRole': checkOutSession.payment_status === 'paid' ? 'premium' : 'basic'
-                            }
-                        })
-                    } else {
-                        await refStore.update({
-                            metadata: {
-                                ...checkOutSession.metadata,
-                                'firebaseRole': checkOutSession.payment_status === 'paid' ? 'premium' : 'basic'
-                            }
-                        })
-                    }
-                    const user = await auth.getUserByEmail(checkOutSession.customer_details.email);
-                    await fireStore
-                        .collection('customers')
-                        .doc(user.uid)
-                        .collection("checkout_sessions")
-                        .add({
-                            mode: "payment",
-                            price: checkOutSession.amount_total,
-                            success_url: checkOutSession.success_url,
-                            cancel_url: checkOutSession.cancel_url,
-                            status: checkOutSession.payment_status,
-                        });
-
-
-                }
-
 
                 break;
 
@@ -171,7 +168,7 @@ app.post('/', express.json({type: 'application/json'}), async (request, response
                         .collection('customers')
                         .where('stripeId', '==', subscription.customer)
                         .limit(1).get();
-                    console.log(subscriptionDoc);
+
                     if (!subscriptionDoc.empty) {
                         subscriptionDoc.forEach(doc => {
                             userUID = doc.id;
@@ -208,7 +205,7 @@ app.post('/', express.json({type: 'application/json'}), async (request, response
 // Return a response to acknowledge receipt of the event
         response.json({received: true});
     }
-)
-;
+);
 
-app.listen(process.env.PORT, () => console.log(`Running on port ${process.env.PORT}`));
+const port = process.env.PORT || 9000;
+app.listen(port, () => console.log(`Running on port ${port}`));

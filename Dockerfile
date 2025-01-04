@@ -1,7 +1,7 @@
 FROM node:18
 WORKDIR /usr/src/app
 COPY package*.json ./
-COPY firebase_configuration_goes_here.json ./
+COPY firebase-admin.json ./
 ENV PORT 2020
 RUN npm install
 COPY . .
