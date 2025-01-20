@@ -1,5 +1,6 @@
 // The following code is an example of a webhook endpoint that listens for Stripe events.
 const express = require('express');
+
 const app = express();
 const dotenv = require('dotenv')
 const firebaseAdmin = require("firebase-admin");
@@ -9,6 +10,7 @@ const {getFirestore} = require("firebase-admin/firestore");
 const {getAuth} = require("firebase-admin/auth");
 dotenv.config();
 
+const stripe = require('stripe')(process.env.STRIPE_ID);
 // SUBSCRIPTION CONSTANT
 
 const Subscription = {
@@ -77,133 +79,148 @@ const createCustomer = async (customerSession) => {
 // Match the raw body to content type application/json
 // If you are using Express v4 - v4.16 you need to use body-parser, not express, to retrieve the request body
 app.post('/webhook', express.json({type: 'application/json'}), async (request, response) => {
-        const event = request.body;
 
-        console.log(event)
+    const sig = request.headers['stripe-signature'];
+    const event = request.body;
 
+        try {
+            const event = stripe.webhooks.constructEvent(
+                request.body,
+                sig,
+                process.env.STRIPE_WEBHOOK_SECRET
+            );
 
-        switch (event.type) {
+            switch (event.type) {
 
-            case 'customer.updated':
-            case 'customer.created':
-                const customerSession = event.data.object;
-                if(customerSession.email === null){
-                    throw new Error('Stripe Email is required to create a user');
-                }
+                case 'customer.updated':
+                case 'customer.created':
+                    const customerSession = event.data.object;
+                    if(customerSession.email === null){
+                        throw new Error('Stripe Email is required to create a user');
+                    }
 
-                const user = await auth.getUserByEmail(customerSession.email);
-                const customerRef = fireStore
-                    .collection('customers')
-                    .doc(user.uid)
-
-
-                const doc = await customerRef.get();
-                if (!doc.exists) {
-                    // exists in Firebase Authentication
                     const user = await auth.getUserByEmail(customerSession.email);
-                    try {
-                        await customerRef.create({
-                            id: user.uid,
-                            stripeId: customerSession.id,
-                            email: customerSession.email,
-                            name: customerSession.name,
-                            phone: customerSession.phone ? customerSession.phone : "",
-                            metadata: {
-                                ...customerSession.metadata,
-                                'firebaseRole': 'basic'
-                            }
-                        });
-                    } catch (e) {
-                        console.error(e);
-                    }
-
-
-                }
-
-                break;
-
-            case   'checkout.session.completed':
-
-                const checkOutSession = event.data.object;
-
-                switch (checkOutSession.payment_status) {
-
-                    case 'paid':
-                        try {
-                            const user = await auth.getUserByEmail(checkOutSession.customer_details.email);
-                            await auth.setCustomUserClaims(user.uid, {
-                                firebaseRole: Subscription.PREMIUM
-                            })
-                            await createCustomer(checkOutSession);
-                        } catch (e) {
-                            console.error(e);
-                        }
-
-                        break;
-
-                    case 'unpaid':
-                        try {
-                            const user = await auth.getUserByEmail(checkOutSession.customer_details.email);
-                            await auth.setCustomUserClaims(user.uid, {
-                                firebaseRole: 'basic'
-                            });
-                            await createCustomer(checkOutSession);
-                        } catch (e) {
-                            console.error(e);
-                        }
-
-                        break;
-                }
-
-                break;
-
-            // handle subscription created and cancelled events
-            case 'customer.subscription.created':
-            case 'customer.subscription.deleted':
-                let userUID = null;
-                const subscription = event.data.object;
-                if (subscription.status !== 'incomplete') {
-
-                    const subscriptionDoc = await fireStore
+                    const customerRef = fireStore
                         .collection('customers')
-                        .where('stripeId', '==', subscription.customer)
-                        .limit(1).get();
+                        .doc(user.uid)
 
-                    if (!subscriptionDoc.empty) {
-                        subscriptionDoc.forEach(doc => {
-                            userUID = doc.id;
-                            if (event.type === 'customer.subscription.created') {
-                                fireStore.collection('customers')
-                                    .doc(userUID).collection('subscriptions')
-                                    .doc(subscription.id).create({
-                                    ...subscription
-                                }).then()
 
-                            }
+                    const doc = await customerRef.get();
+                    if (!doc.exists) {
+                        // exists in Firebase Authentication
+                        const user = await auth.getUserByEmail(customerSession.email);
+                        try {
+                            await customerRef.create({
+                                id: user.uid,
+                                stripeId: customerSession.id,
+                                email: customerSession.email,
+                                name: customerSession.name,
+                                phone: customerSession.phone ? customerSession.phone : "",
+                                metadata: {
+                                    ...customerSession.metadata,
+                                    'firebaseRole': 'basic'
+                                }
+                            });
+                        } catch (e) {
+                            console.error(e);
+                        }
 
-                            if(event.type === 'customer.subscription.deleted'){
-                                fireStore.collection('customers').doc(userUID).update({
-                                    metadata: {
-                                        ...subscription.metadata,
-                                        'firebaseRole': 'basic'
-                                    }
-                                })
-                                fireStore.collection('customers')
-                                    .doc(userUID).collection('subscriptions')
-                                    .doc(subscription.id).delete().then()
-                            }
-                        });
+
                     }
-                }
+
+                    break;
+
+                case   'checkout.session.completed':
+
+                    const checkOutSession = event.data.object;
+
+                    switch (checkOutSession.payment_status) {
+
+                        case 'paid':
+                            try {
+                                const user = await auth.getUserByEmail(checkOutSession.customer_details.email);
+                                await auth.setCustomUserClaims(user.uid, {
+                                    firebaseRole: Subscription.PREMIUM
+                                })
+                                await createCustomer(checkOutSession);
+                            } catch (e) {
+                                console.error(e);
+                            }
+
+                            break;
+
+                        case 'unpaid':
+                            try {
+                                const user = await auth.getUserByEmail(checkOutSession.customer_details.email);
+                                await auth.setCustomUserClaims(user.uid, {
+                                    firebaseRole: 'basic'
+                                });
+                                await createCustomer(checkOutSession);
+                            } catch (e) {
+                                console.error(e);
+                            }
+
+                            break;
+                    }
+
+                    break;
+
+                // handle subscription created and cancelled events
+                case 'customer.subscription.created':
+                case 'customer.subscription.updated':
+                case 'customer.subscription.deleted':
+                    let userUID = null;
+                    const subscription = event.data.object;
+                    if (subscription.status !== 'incomplete') {
+
+                        const subscriptionDoc = await fireStore
+                            .collection('customers')
+                            .where('stripeId', '==', subscription.customer)
+                            .limit(1).get();
+
+                        if (!subscriptionDoc.empty) {
+                            subscriptionDoc.forEach(doc => {
+                                userUID = doc.id;
+                                if (event.type === 'customer.subscription.created') {
+                                    fireStore.collection('customers')
+                                        .doc(userUID).collection('subscriptions')
+                                        .doc(subscription.id).create({
+                                        ...subscription
+                                    }).then()
+
+                                }
+
+                                if(event.type === 'customer.subscription.deleted'){
+                                    fireStore.collection('customers').doc(userUID).update({
+                                        metadata: {
+                                            ...subscription.metadata,
+                                            'firebaseRole': 'basic'
+                                        }
+                                    })
+                                    fireStore.collection('customers')
+                                        .doc(userUID).collection('subscriptions')
+                                        .doc(subscription.id).delete().then()
+                                }
+                            });
+                        }
+                    }
 
 
-                break;
-            default:
-                console.log(`Unhandled event type ${event.type}`);
+                    break;
+                default:
+                    console.log(`Unhandled event type ${event.type}`);
+            }
+
+            response.json({ received: true });
+        } catch (error) {
+            console.error('Webhook error:', error);
+            response.status(400).send(`Webhook Error: ${error.message}`);
         }
 
-// Return a response to acknowledge receipt of the event
-        response.json({received: true});
+
+
+
+
     }
 );
 
